@@ -803,6 +803,144 @@ fn conpty_realign_is_a_noop_when_both_sides_agree() {
     assert_eq!(term.grid[Line(0)][Column(0)].c, 'a');
 }
 
+/// 把 `text` 写进 `row` 的前几列，其余保持空白。
+fn write_row(term: &mut Term<VoidListener>, row: i32, text: &str) {
+    for (column, c) in text.chars().enumerate() {
+        term.grid[Line(row)][Column(column)].c = c;
+    }
+}
+
+#[test]
+fn conpty_realign_to_shifts_content_under_a_cursor_that_already_matches() {
+    // 2026-11-12 缩放事故现场：上一轮只按光标行的对账把内容滚高了 3 行，
+    // 应用随后按 conhost 坐标发的绝对 CUP 又把光标放回原位——光标行与
+    // conhost 相同，内容却高了 3 行。按内容对账必须把内容下移回去。
+    let size = TermSize::new(12, 6);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    write_row(&mut term, 0, "alpha");
+    write_row(&mut term, 1, "beta");
+    write_row(&mut term, 2, "input");
+    write_row(&mut term, 3, "footer");
+    term.grid.cursor.point = Point::new(Line(5), Column(0));
+
+    let conhost = ConhostViewportText::new(
+        6,
+        5,
+        0,
+        vec![
+            String::new(),
+            String::new(),
+            "alpha".into(),
+            "beta".into(),
+            "input".into(),
+            "footer".into(),
+        ],
+    )
+    .expect("snapshot");
+
+    assert!(term.conpty_realign_to(&conhost));
+
+    assert_eq!(term.history_size(), 0);
+    assert_eq!(term.grid.cursor.point, Point::new(Line(5), Column(0)));
+    assert_eq!(term.grid[Line(2)][Column(0)].c, 'a');
+    assert_eq!(term.grid[Line(5)][Column(0)].c, 'f');
+}
+
+#[test]
+fn conpty_realign_to_adopts_the_conhost_cursor_when_content_matches() {
+    // 内容逐行对得上时，错的是光标：直接采用 conhost 的光标行，内容不动。
+    let size = TermSize::new(12, 6);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    write_row(&mut term, 0, "alpha");
+    write_row(&mut term, 1, "beta");
+    write_row(&mut term, 2, "input");
+    write_row(&mut term, 3, "footer");
+    term.grid.cursor.point = Point::new(Line(5), Column(0));
+
+    let conhost = ConhostViewportText::new(
+        6,
+        2,
+        0,
+        vec![
+            "alpha".into(),
+            "beta".into(),
+            "input".into(),
+            "footer".into(),
+            String::new(),
+            String::new(),
+        ],
+    )
+    .expect("snapshot");
+
+    assert!(term.conpty_realign_to(&conhost));
+
+    assert_eq!(term.history_size(), 0);
+    assert_eq!(term.grid.cursor.point, Point::new(Line(2), Column(0)));
+    assert_eq!(term.grid[Line(0)][Column(0)].c, 'a');
+}
+
+#[test]
+fn conpty_realign_to_keeps_the_grid_when_content_is_not_recognized() {
+    let size = TermSize::new(12, 6);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    write_row(&mut term, 0, "alpha");
+    term.grid.cursor.point = Point::new(Line(4), Column(0));
+
+    let conhost = ConhostViewportText::new(
+        6,
+        3,
+        0,
+        vec![
+            "totally".into(),
+            "different".into(),
+            "screen".into(),
+            "here".into(),
+            String::new(),
+            String::new(),
+        ],
+    )
+    .expect("snapshot");
+
+    assert!(!term.conpty_realign_to(&conhost));
+    assert_eq!(term.grid.cursor.point, Point::new(Line(4), Column(0)));
+    assert_eq!(term.history_size(), 0);
+    assert_eq!(term.grid[Line(0)][Column(0)].c, 'a');
+}
+
+#[test]
+fn conpty_realign_to_refuses_an_ambiguous_shift() {
+    // 周期性内容让“位移 0”和“下移 2 行”同分：证据分辨不出真实位移，
+    // 任取其一都可能把内容永久搬错，必须保持原样。
+    let size = TermSize::new(12, 6);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    for row in 0..6 {
+        write_row(&mut term, row, if row % 2 == 0 { "aaa" } else { "bbb" });
+    }
+    term.grid.cursor.point = Point::new(Line(5), Column(0));
+
+    let conhost = ConhostViewportText::new(
+        6,
+        2,
+        2,
+        vec!["aaa".into(), "bbb".into(), "aaa".into(), "bbb".into()],
+    )
+    .expect("snapshot");
+
+    assert!(!term.conpty_realign_to(&conhost));
+    assert_eq!(term.grid.cursor.point, Point::new(Line(5), Column(0)));
+    assert_eq!(term.history_size(), 0);
+}
+
+#[test]
+fn conhost_viewport_text_rejects_inconsistent_samples() {
+    assert!(ConhostViewportText::new(0, 0, 0, Vec::new()).is_none());
+    assert!(ConhostViewportText::new(6, 6, 0, vec!["a".into(); 6]).is_none());
+    assert!(ConhostViewportText::new(6, 0, 0, Vec::new()).is_none());
+    // 样本没有贴着视口底部：行号锚不可信。
+    assert!(ConhostViewportText::new(6, 0, 2, vec!["a".into(); 3]).is_none());
+    assert!(ConhostViewportText::new(6, 0, 3, vec!["a".into(); 3]).is_some());
+}
+
 #[test]
 fn reflow_keeps_prompt_input_at_the_logical_cursor() {
     let size = TermSize::new(6, 3);

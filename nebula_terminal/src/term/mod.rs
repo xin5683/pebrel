@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 pub mod cell;
 mod clear;
 pub mod color;
+mod conpty_align;
 mod damage;
 mod grid_content;
 mod inline_image;
@@ -47,6 +48,7 @@ pub mod search;
 mod title;
 mod viewport;
 
+pub use conpty_align::ConhostViewportText;
 use damage::TermDamageState;
 pub use damage::{LineDamageBounds, TermDamage, TermDamageIterator};
 pub use renderable::{RenderableContent, RenderableCursor};
@@ -882,59 +884,6 @@ impl<T> Term<T> {
         let line = &mut self.vi_mode_cursor.point.line;
         if (top <= *line) && region.end > *line {
             *line = cmp::max(*line - lines, top);
-        }
-        self.mark_fully_damaged();
-    }
-
-    /// ConPTY 对账重锚：把主屏光标搬到 `target` 视口行。
-    ///
-    /// 背景（字节级取证，2026-08）：`ResizePseudoConsole` 之后 conhost 的行
-    /// 坐标与本地 reflow 的结果会朝两个方向偏。
-    ///
-    /// 一、塌缩（顶端对齐）：conhost 把自身缓冲区压成"视口高、零回滚、内容
-    /// 顶端对齐"，光标停在内容末行——高于视口底；而本地 reflow 保留完整历史、
-    /// 光标钉在视口底。此时 `target < cursor`，多出的顶部行滚入历史。
-    ///
-    /// 二、变宽/变窄导致的折行差（分屏、拖分界、面板开合）：conhost 的 buffer
-    /// rewrap 与本地 reflow 的换行语义不同，同一批字节折出的行数可以差几行。
-    /// conhost 折得更多时它的视口顶部还留着我们已经推进历史的行，提示符相应
-    /// 更靠下，`target > cursor`；缺的行在光标上方补回，内容整体下移。
-    ///
-    /// 两个方向都必须处理：只修一边时另一边会让 PSReadLine 按 conhost 坐标
-    /// 发出的绝对 CUP 永久落在错行——提示符停在一处，回显砸在几行之下
-    /// （现场：分屏后 `prompts=[15]` 而 `cursor=19`）。该偏差在 conhost 内部
-    /// 且非确定性，事前无法预测，conhost 也不重绘（直通模式零字节），唯一可靠
-    /// 做法是事后向 conhost 要真值（`AttachConsole` +
-    /// `GetConsoleScreenBufferInfo`，见 event_loop 的对账探针）并把本地网格滚
-    /// 到同一坐标系。滚动后两侧光标同行，后续输出同步推进，永久对齐；被滚走
-    /// 的行仍在历史里可回看。
-    pub fn conpty_realign(&mut self, target: usize) {
-        if self.mode.contains(TermMode::ALT_SCREEN) {
-            return;
-        }
-        let cursor = self.grid.cursor.point.line.0;
-        if cursor < 0 {
-            return;
-        }
-        let cursor = cursor as usize;
-        let delta = cursor.abs_diff(target);
-        if delta == 0 || delta >= self.screen_lines() {
-            return;
-        }
-        self.reset_input_cluster();
-        let region = Line(0)..Line(self.screen_lines() as i32);
-        // 选区跟着内容走：`rotate` 的正负与内容位移同向（上滚为负）。
-        let rotation = if target < cursor { delta as i32 } else { -(delta as i32) };
-        self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, rotation));
-        if target < cursor {
-            self.grid.scroll_up(&region, delta);
-            self.grid.cursor.point.line = self.grid.cursor.point.line - delta;
-        } else {
-            // 顶部补出的行是空的：被 conhost 留在视口里的那几行在我们这边
-            // 已经进了历史，取不回来。视觉代价是几行空白，换来的是此后每一
-            // 条绝对 CUP 都落在正确的行。
-            self.grid.scroll_down(&region, delta);
-            self.grid.cursor.point.line = self.grid.cursor.point.line + delta;
         }
         self.mark_fully_damaged();
     }

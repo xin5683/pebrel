@@ -20,7 +20,7 @@ use crate::grid::Dimensions as _;
 use crate::index::{Column, Line};
 use crate::osc_cwd::OscEvent;
 use crate::sync::FairMutex;
-use crate::term::Term;
+use crate::term::{ConhostViewportText, Term};
 use crate::{thread, tty};
 use vte::ansi;
 
@@ -106,13 +106,19 @@ struct PendingResize {
 }
 
 /// conhost 的一次光标真值读数。
-#[derive(Copy, Clone, Debug)]
-struct ConhostCursor {
+#[derive(Clone, Debug)]
+struct ConhostProbe {
     /// 视口相对行（0 基）。
     row: usize,
     /// conhost 自己的视口高度，用来判断新尺寸有没有落地。
     rows: u16,
+    /// 视口底部文本；读取失败为 `None`，此时退回只按光标行对账。
+    viewport: Option<ConhostViewportText>,
 }
+
+/// 对账时读取的视口底部行数。底部是最新输出所在：shell 提示符、Claude Code
+/// 等增量重绘 TUI 的输入框和页脚都在这里，足够定位整段内容的行差。
+const ALIGN_TAIL_ROWS: usize = 12;
 
 /// 向 conhost 要光标真值：临时 `AttachConsole` 到 ConPTY 子进程的控制台，
 /// 读 `GetConsoleScreenBufferInfo`，换算成视口相对行（0 基）。
@@ -122,7 +128,7 @@ struct ConhostCursor {
 /// （自身无控制台），detach 后回到无控制台状态，不影响任何组件。失败
 /// （子进程已退出、权限等）一律返回 None，对账静默放弃。
 #[cfg(windows)]
-fn conpty_cursor_probe(pid: u32) -> Option<ConhostCursor> {
+fn conpty_cursor_probe(pid: u32) -> Option<ConhostProbe> {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
@@ -161,6 +167,9 @@ fn conpty_cursor_probe(pid: u32) -> Option<ConhostCursor> {
         }
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
         let ok = GetConsoleScreenBufferInfo(handle, &mut info);
+        // 视口底部文本：按内容对账的真值。读取失败只丢文本真值，光标行
+        // 仍然可用。
+        let viewport = if ok != 0 { read_viewport_text(handle, &info) } else { None };
         CloseHandle(handle);
         FreeConsole();
         if ok == 0 {
@@ -168,15 +177,69 @@ fn conpty_cursor_probe(pid: u32) -> Option<ConhostCursor> {
         }
         let row = i32::from(info.dwCursorPosition.Y) - i32::from(info.srWindow.Top);
         let rows = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
-        Some(ConhostCursor {
+        Some(ConhostProbe {
             row: usize::try_from(row).ok()?,
             rows: u16::try_from(rows.max(0)).ok()?,
+            viewport,
         })
     }
 }
 
+/// 读取 conhost 视口底部 `ALIGN_TAIL_ROWS` 行的真实文本。
+///
+/// 任何一行读取失败都返回 `None`：半截样本与任何位移都对不上，只会白费
+/// 一次对账。
+///
+/// # Safety
+///
+/// `handle` 必须是该控制台上已打开的 `CONOUT$` 句柄，`info` 必须来自它的
+/// `GetConsoleScreenBufferInfo`。
+#[cfg(windows)]
+unsafe fn read_viewport_text(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    info: &windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO,
+) -> Option<ConhostViewportText> {
+    use windows_sys::Win32::System::Console::{COORD, ReadConsoleOutputCharacterW};
+
+    let left = i32::from(info.srWindow.Left);
+    let top = i32::from(info.srWindow.Top);
+    let width = i32::from(info.srWindow.Right) - left + 1;
+    let height = i32::from(info.srWindow.Bottom) - top + 1;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let rows = height as usize;
+    let sampled = ALIGN_TAIL_ROWS.min(rows);
+    let first_row = rows - sampled;
+    let mut buffer = vec![0u16; width as usize];
+    let mut lines = Vec::with_capacity(sampled);
+    for row in first_row..rows {
+        let origin = COORD { X: left as i16, Y: (top + row as i32) as i16 };
+        let mut read = 0u32;
+        // SAFETY: 调用方保证了句柄有效；读取范围限定在该视口内。
+        let read_ok = unsafe {
+            ReadConsoleOutputCharacterW(
+                handle,
+                buffer.as_mut_ptr(),
+                width as u32,
+                origin,
+                &mut read,
+            )
+        };
+        if read_ok == 0 {
+            return None;
+        }
+        let text = String::from_utf16_lossy(&buffer[..read as usize]);
+        lines.push(text.trim_end_matches(' ').to_string());
+    }
+
+    let cursor_row = usize::try_from(i32::from(info.dwCursorPosition.Y) - top).ok()?;
+    ConhostViewportText::new(rows, cursor_row, first_row, lines)
+}
+
 #[cfg(not(windows))]
-fn conpty_cursor_probe(_pid: u32) -> Option<ConhostCursor> {
+fn conpty_cursor_probe(_pid: u32) -> Option<ConhostProbe> {
     None
 }
 
@@ -565,7 +628,12 @@ where
         Ok(resize)
     }
 
-    /// 向 conhost 要光标真值并把本地网格滚到同一坐标系。
+    /// 向 conhost 要光标真值并把本地网格对到同一坐标系。
+    ///
+    /// 首选按 conhost 视口底部的**真实文本**对账：光标行在光标下方还有
+    /// 内容的 TUI（Claude Code 的输入框边框、页脚行）里不代表内容行差，
+    /// 只按光标滚一次就会把整屏内容搬走，之后的增量重绘全部错行。文本
+    /// 探针不可用（读取失败、视口高度还没落地）时才退回只对光标行的老路。
     ///
     /// `expect_rows` 非 None 时只采信视口高度已经等于该值的读数：
     /// `ResizePseudoConsole` 之后 conhost 若还停在旧几何，它报的行号属于上一
@@ -577,8 +645,10 @@ where
         };
         if resize_trace_enabled() {
             eprintln!(
-                "[nebula:resize-trace] {stage} conhost row={} rows={} expect_rows={expect_rows:?}",
-                probe.row, probe.rows,
+                "[nebula:resize-trace] {stage} conhost row={} rows={} text_rows={} expect_rows={expect_rows:?}",
+                probe.row,
+                probe.rows,
+                probe.viewport.as_ref().map_or(0, |viewport| viewport.lines.len()),
             );
         }
         if expect_rows.is_some_and(|rows| rows != probe.rows) {
@@ -586,7 +656,22 @@ where
         }
         let mut terminal = self.terminal.lock();
         trace_terminal_state(&format!("before-{stage}"), &terminal);
-        terminal.conpty_realign(probe.row);
+        // 视口高度已经落地才采信文本快照；文本不可用时退回只对光标行的
+        // 老路。文本可用但对账不成立时保持原样——盲滚会把内容永久搬错行。
+        let viewport = probe.viewport.filter(|v| v.rows == terminal.grid().screen_lines());
+        let aligned = match viewport {
+            Some(viewport) => terminal.conpty_realign_to(&viewport),
+            None => {
+                terminal.conpty_realign(probe.row);
+                true
+            },
+        };
+        if resize_trace_enabled() {
+            eprintln!(
+                "[nebula:resize-trace] {stage} aligned={aligned} cursor={:?}",
+                terminal.grid().cursor.point,
+            );
+        }
         trace_terminal_state(&format!("after-{stage}"), &terminal);
         drop(terminal);
         self.event_proxy.send_event(Event::Wakeup);
