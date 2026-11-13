@@ -32,6 +32,9 @@ impl Render for NebulaWorkspace {
         self.sync_document_activity(window, cx);
         self.sync_terminal_activity(cx);
         self.sync_document_details(cx);
+        // 缩放浮层每个 animation frame 采样一次；逻辑状态已经决定布局，
+        // 这里只推进 Ghost 位置和遮罩透明度（真实终端不再逐帧改 bounds）。
+        self.advance_zoom_motion(window, cx);
         if !self.sidebar_collapsed {
             self.sidebar_closing_width = None;
         }
@@ -197,8 +200,8 @@ impl Render for NebulaWorkspace {
                 let ix = this.active;
                 this.begin_rename(ix, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleZoom, _, cx| {
-                this.toggle_zoom(cx);
+            .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| {
+                this.toggle_zoom(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusPaneLeft, window, cx| {
                 this.navigate_pane(SplitNav::Left, window, cx);

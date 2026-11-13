@@ -4,6 +4,9 @@ use super::*;
 use crate::gpui_shell::workspace::{TerminalPane, terminal_activity};
 
 impl NebulaWorkspace {
+    /// `live_surface`：宿主正在做透明度过渡时必须为 true。缓存表面的 paint
+    /// range 会把当时的 `element_opacity` 烘进图元，父级透明度变化不会让
+    /// 缓存失效（见 `terminal_surface_live`）。
     #[allow(clippy::too_many_arguments)]
     pub(in crate::gpui_shell::workspace) fn render_terminal_pane(
         &self,
@@ -13,6 +16,7 @@ impl NebulaWorkspace {
         multiple: bool,
         focused: bool,
         zoomed: bool,
+        live_surface: bool,
         broadcast: bool,
         corners: HeaderCorners,
         cx: &mut Context<Self>,
@@ -31,6 +35,11 @@ impl NebulaWorkspace {
         } else {
             gpui::black().opacity(crate::display::NEBULA_UNFOCUSED_SPLIT_DIM)
         };
+        let surface = if live_surface {
+            terminal_activity::terminal_surface_live(pane)
+        } else {
+            terminal_activity::terminal_surface(pane)
+        };
         let mut body = div()
             .id(("pane-body", id as usize))
             .debug_selector(move || format!("pane-body-{id}"))
@@ -38,7 +47,7 @@ impl NebulaWorkspace {
             .min_w_0()
             .min_h_0()
             .relative()
-            .child(terminal_activity::terminal_surface(pane))
+            .child(surface)
             .when(dim, |body| body.child(div().absolute().inset_0().bg(veil)));
         if sidebar && multiple {
             // Overlays never reserve a terminal row, including while hovered or zoomed.

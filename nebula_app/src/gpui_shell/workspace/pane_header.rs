@@ -434,7 +434,7 @@ impl NebulaWorkspace {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.focus_pane(tab_ix, pane_id, window, cx);
-                                this.toggle_zoom(cx);
+                                this.toggle_zoom(window, cx);
                             })),
                     )
                     .child(
@@ -549,10 +549,11 @@ impl NebulaWorkspace {
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        // 单 pane 没有「拉出去」的语义（它本来就是独立 tab）。
+        // 单 pane 没有「拉出去」的语义（它本来就是独立 tab）；放大态下
+        // 屏幕上的几何是悬浮卡，分屏槽位不在指针下方，拖拽命中会失真。
         let splittable = matches!(
             self.tabs.get(tab_ix),
-            Some(WorkspaceTab::Terminal { panes, .. }) if panes.len() > 1
+            Some(WorkspaceTab::Terminal { panes, zoomed: false, .. }) if panes.len() > 1
         );
         if !splittable {
             return;

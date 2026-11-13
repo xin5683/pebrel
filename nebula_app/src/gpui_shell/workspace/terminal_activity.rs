@@ -8,6 +8,20 @@ pub(super) fn terminal_surface(pane: &TerminalPane) -> gpui::ViewElement<Entity<
     pane.view.clone().cached(gpui::StyleRefinement::default().size_full())
 }
 
+/// 不缓存绘制结果、每帧重绘的终端表面，供父级正在淡入淡出的宿主使用。
+///
+/// `ViewElement` 的缓存键只有 bounds / content mask / text style，**不含
+/// 元素透明度**；而 paint 时 `window.element_opacity()` 会被直接乘进每个
+/// 图元的颜色并记进 paint range。若终端第一次是在 `opacity(0)` 的祖先里
+/// 绘制的，之后父级透明度回升时缓存命中会原样重放那批透明图元，画面就
+/// 停在卡底色上（现场：放大结束后的白屏，敲入内容触发 notify 打破缓存后
+/// 才恢复）。透明过渡期间逐帧重绘，稳态再交回 [`terminal_surface`]。
+pub(super) fn terminal_surface_live(
+    pane: &TerminalPane,
+) -> gpui::ViewElement<Entity<TerminalView>> {
+    pane.view.clone().into_element()
+}
+
 impl WorkspaceTab {
     /// Shared with the zoomed/single-pane renderer, including its empty-focus fallback.
     pub(super) fn primary_terminal_pane(&self) -> Option<&TerminalPane> {
@@ -156,12 +170,12 @@ impl NebulaWorkspace {
 
     pub(super) fn sync_terminal_activity(&self, cx: &mut Context<Self>) {
         for (index, tab) in self.tabs.iter().enumerate() {
-            let WorkspaceTab::Terminal { panes, tree, zoomed, .. } = tab else { continue };
+            let WorkspaceTab::Terminal { panes, .. } = tab else { continue };
             let active = index == self.active && !self.settings_open && !self.window_hidden;
-            let primary = tab.primary_terminal_pane().map(|pane| pane.id);
+            // 放大态下分屏仍然完整绘制（压暗），聚焦 pane 只是搬到浮层里；
+            // 不能像旧实现那样把其余 pane 标记为不可见，否则背景会露空。
             for pane in panes {
-                let visible = active && (!*zoomed && !tree.is_leaf() || primary == Some(pane.id));
-                pane.view.update(cx, |view, cx| view.set_output_visible(visible, cx));
+                pane.view.update(cx, |view, cx| view.set_output_visible(active, cx));
             }
         }
     }
@@ -559,16 +573,53 @@ mod tests {
         let (workspace, terminals, _receivers, mut window) = open_painted_workspace(&[2], cx);
         assert_spinner_reuses_terminal_paint(&workspace, &terminals, &mut window);
         let split_grid = painted(&terminals[0], &mut window).grid;
-        workspace.update(&mut window, |workspace, cx| {
-            let WorkspaceTab::Terminal { zoomed, .. } = &mut workspace.tabs[0] else {
+        let focused = workspace.read_with(&window, |workspace, _| {
+            let WorkspaceTab::Terminal { focused, .. } = &workspace.tabs[0] else {
                 unreachable!();
             };
-            *zoomed = true;
-            cx.notify();
+            *focused
+        });
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.set_zoom(0, focused, true, window, cx));
+                assert!(workspace.zoom_motion.is_some());
+            });
         });
         draw(&mut window);
-        assert!(painted(&terminals[0], &mut window).grid.1 > split_grid.1);
+        let zoomed = painted(&terminals[0], &mut window).grid;
+        assert!(zoomed.1 > split_grid.1, "zoomed={zoomed:?} split={split_grid:?}");
         assert_spinner_reuses_terminal_paint(&workspace, &terminals, &mut window);
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.set_zoom(0, focused, false, window, cx));
+            });
+        });
+        draw(&mut window);
+        window.update(|window, cx| {
+            assert!(terminals[0].read(cx).focus_handle.is_focused(window));
+        });
+        workspace.read_with(&window, |workspace, _| {
+            assert!(workspace.zoom_motion.is_none());
+        });
+        assert_eq!(painted(&terminals[0], &mut window).grid, split_grid);
+    }
+
+    #[gpui::test]
+    fn zoom_on_a_single_pane_is_a_noop(cx: &mut TestAppContext) {
+        let (workspace, _terminals, _receivers, mut window) = open_painted_workspace(&[1], cx);
+        let focused = workspace.read_with(&window, |workspace, _| {
+            let WorkspaceTab::Terminal { focused, .. } = &workspace.tabs[0] else {
+                unreachable!();
+            };
+            *focused
+        });
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(!workspace.set_zoom(0, focused, true, window, cx));
+                assert!(matches!(&workspace.tabs[0], WorkspaceTab::Terminal { zoomed: false, .. }));
+                assert!(workspace.zoom_motion.is_none());
+            });
+        });
     }
 
     #[gpui::test]
@@ -645,7 +696,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rendered_tabs_splits_zoom_and_settings_restore_only_presented_panes(
+    fn rendered_tabs_splits_zoom_and_settings_keep_only_the_active_tab_visible(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
@@ -738,8 +789,9 @@ mod tests {
         };
         check(1, false, false, false, [0, 0, 1]);
         check(0, false, false, false, [1, 1, 0]);
+        // 放大不再把背景 pane 标记为不可见：它们仍要被绘制并压暗。
         check(0, true, false, false, [0, 0, 0]);
-        check(0, false, false, false, [0, 1, 0]);
+        check(0, false, false, false, [0, 0, 0]);
         check(0, false, true, false, [0, 0, 0]);
         check(0, false, false, false, [1, 1, 0]);
         check(0, false, false, true, [0, 0, 0]);

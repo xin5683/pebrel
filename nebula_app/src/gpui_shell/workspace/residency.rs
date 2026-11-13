@@ -281,6 +281,10 @@ impl NebulaWorkspace {
                         ));
                     };
                     self.active = tab_ix;
+                    // 放大态切到另一个 pane：与点击/导航同一时间线，先还原再改焦点。
+                    if let Some(zoomed_pane) = self.zoom_pane_to_restore(tab_ix, *pane_id) {
+                        self.set_zoom(tab_ix, zoomed_pane, false, window, cx);
+                    }
                     if let Some(WorkspaceTab::Terminal { focused, zoomed, .. }) =
                         self.tabs.get_mut(tab_ix)
                     {
@@ -456,26 +460,22 @@ impl NebulaWorkspace {
                         format!("pane {pane_id} does not exist"),
                     ));
                 };
-                let changed = {
-                    let Some(WorkspaceTab::Terminal { panes, focused, zoomed: current, .. }) =
-                        self.tabs.get_mut(tab_ix)
-                    else {
-                        return Err(ApiError::new("invalid_state", "only terminal panes can zoom"));
-                    };
-                    if *zoomed && panes.len() < 2 {
-                        return Err(ApiError::new(
-                            "invalid_state",
-                            "a single-pane tab is already full size and cannot be zoomed",
-                        ));
-                    }
-                    *focused = *pane_id;
-                    let changed = *current != *zoomed;
-                    *current = *zoomed;
-                    changed
-                };
+                let available = matches!(
+                    self.tabs.get(tab_ix),
+                    Some(WorkspaceTab::Terminal { panes, .. }) if panes.len() > 1
+                );
+                if *zoomed && !available {
+                    return Err(ApiError::new(
+                        "invalid_state",
+                        "a single-pane tab is already full size and cannot be zoomed",
+                    ));
+                }
                 self.active = tab_ix;
-                if changed {
-                    self.mark_structural_resize(tab_ix, cx);
+                self.set_zoom(tab_ix, *pane_id, *zoomed, window, cx);
+                // 幂等请求也要把焦点落到目标 pane；set_zoom 只在状态翻转时
+                // 写 focused（关闭方向可能带着旧卡的目标 pane）。
+                if let Some(WorkspaceTab::Terminal { focused, .. }) = self.tabs.get_mut(tab_ix) {
+                    *focused = *pane_id;
                 }
                 self.focus_active(window, cx);
                 self.sync_side_panel_to_active(true, cx);

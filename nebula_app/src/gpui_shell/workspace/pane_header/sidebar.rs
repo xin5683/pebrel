@@ -346,7 +346,7 @@ impl NebulaWorkspace {
                 let _ = zoom_owner.update(cx, |this, cx| {
                     if let Some(tab) = this.tab_of_pane(id) {
                         this.focus_pane(tab, id, window, cx);
-                        this.toggle_zoom(cx);
+                        this.toggle_zoom(window, cx);
                     }
                 });
             }),

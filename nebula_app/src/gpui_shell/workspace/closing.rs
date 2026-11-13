@@ -79,6 +79,7 @@ impl NebulaWorkspace {
         cx: &mut Context<Self>,
     ) -> bool {
         self.theme_transition.clear(window);
+        self.clear_zoom_motion(window);
         windowing::quick_terminal_bounds_changed(self.runtime_window_id, window, cx);
         if self.window_close_pending {
             return false;

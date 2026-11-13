@@ -1,8 +1,9 @@
 //! Workspace keyboard actions and their tab/focus transitions.
 
 use gpui::{Context, Focusable as _, Window};
+use nebula_split::SplitNav;
 
-use super::{NebulaWorkspace, WorkspaceTab};
+use super::{NebulaWorkspace, WorkspaceTab, to_split_rect};
 
 /// 标签左移/右移的落点。**不环绕**：首个标签再左移、末个再右移都是 no-op。
 /// 环绕在这里是有害的——用户按住键连点想把标签推到最左，环绕会让它突然
@@ -35,6 +36,40 @@ impl NebulaWorkspace {
             None => return,
         };
         window.defer(cx, move |window, cx| window.focus(&focus, cx));
+    }
+
+    /// ctrl+alt+方向：按上一帧 pane 矩形找目标方向最近邻（垂直漂移 4 倍
+    /// 惩罚，`nebula_split::nav_target` 与旧壳同式）。缩放态先退出缩放再
+    /// 导航，pane 矩形下一帧才有——本次导航按缩放前记录的矩形执行。
+    pub(super) fn navigate_pane(
+        &mut self,
+        nav: SplitNav,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active;
+        let Some((focused_id, rects)) = (|| {
+            let WorkspaceTab::Terminal { panes, focused, .. } = self.tabs.get(active)? else {
+                return None;
+            };
+            if panes.len() < 2 {
+                return None;
+            }
+            let bounds = self.pane_bounds.borrow();
+            let rects = panes
+                .iter()
+                .filter_map(|pane| bounds.get(&pane.id).map(|b| (pane.id, to_split_rect(b))))
+                .collect::<Vec<_>>();
+            Some((*focused, rects))
+        })() else {
+            return;
+        };
+        self.exit_zoom(active, window, cx);
+        if let Some(target) = nebula_split::nav_target(&rects, focused_id, nav) {
+            self.focus_pane(active, target, window, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub(super) fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {

@@ -18,7 +18,7 @@
 //!   `set_layout`，resize 合并/提交合同（burst + settle）原样生效——分屏
 //!   拖拽期间 PTY 跟随提交比例，松手后一次落定，与旧壳语义一致。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -83,6 +83,7 @@ pub(crate) mod shell_launch;
 mod shell_picker;
 mod sidebar_resize;
 mod terminal_activity;
+mod zoom_overlay;
 use shell_picker::shell_palette_rows;
 mod settings_navigation;
 mod sidebar;
@@ -204,7 +205,8 @@ enum WorkspaceTab {
         tree: SplitTree<u64>,
         /// 聚焦 pane：键盘输入焦点与 split/close 动作的作用对象。
         focused: u64,
-        /// 缩放：聚焦 pane 临时满卡（ctrl+shift+enter，旧壳 ToggleZoom）；
+        /// 缩放：聚焦 pane 临时浮成带边距的卡片（ctrl+shift+enter）；弹簧/
+        /// 快照等瞬态表现由 workspace 级 `zoom_motion` 持有。
         /// 任何结构性操作（split/close/导航/点击别的 pane）都先解除。
         zoomed: bool,
         /// 广播输入：开启后聚焦 pane 的击键/文本同步到本 tab 其余 pane。
@@ -679,6 +681,11 @@ pub struct NebulaWorkspace {
     split_bounds: SplitBoundsStore,
     /// pane 矩形的帧记录（ctrl+alt+方向 的最近邻导航用）。
     pane_bounds: PaneBoundsStore,
+    /// 终端卡内容区矩形的上一帧记录（tab 下标 + 窗口坐标）；缩放浮层的目标
+    /// 几何和 Ghost 起止点都读它。
+    zoom_bounds: Rc<Cell<Option<(usize, Bounds<Pixels>)>>>,
+    /// 缩放浮层的瞬态动画/快照状态；`WorkspaceTab.zoomed` 仍是逻辑权威。
+    zoom_motion: Option<zoom_overlay::ZoomMotion>,
     /// 标题栏背景使用本帧实际终端列边界，与两侧面板和卡缝连续衔接。
     titlebar_background: window_titlebar::TitleBarBackground,
     theme_transition: crate::gpui_shell::theme::ThemeTransition,
@@ -950,6 +957,8 @@ impl NebulaWorkspace {
             reader_focus: None,
             split_bounds: Rc::new(RefCell::new(HashMap::new())),
             pane_bounds: Rc::new(RefCell::new(HashMap::new())),
+            zoom_bounds: Rc::new(Cell::new(None)),
+            zoom_motion: None,
             titlebar_background: window_titlebar::TitleBarBackground::default(),
             theme_transition: crate::gpui_shell::theme::ThemeTransition::default(),
             command_palette_open: false,
@@ -1371,6 +1380,9 @@ impl NebulaWorkspace {
         panes.push(pane);
         *focused = new_id;
         *zoomed = false;
+        // 分屏是结构性变化，缩放浮层（含在飞的 Ghost）直接收掉，
+        // 不让旧动画把一张已经不存在的分屏画面拖到新树布局上。
+        self.clear_zoom_motion_for_tab(active, window);
         self.mark_structural_resize(active, cx);
         self.focus_active(window, cx);
         self.sync_side_panel_to_active(true, cx);
@@ -1448,6 +1460,8 @@ impl NebulaWorkspace {
                 }
                 self.remote_browser.forget(pane_id);
                 self.pane_bounds.borrow_mut().remove(&pane_id);
+                // 关任何 pane 都解除缩放（既有语义）；浮层和 Ghost 一并收掉。
+                self.clear_zoom_motion_for_tab(tab_ix, window);
                 self.mark_structural_resize(tab_ix, cx);
                 if tab_ix == self.active {
                     if self.pane_rename.is_none() {
@@ -1483,6 +1497,10 @@ impl NebulaWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 放大态下切到另一个 pane：先按正常时间线还原，再把焦点交过去。
+        if let Some(zoomed_pane) = self.zoom_pane_to_restore(tab_ix, pane_id) {
+            self.set_zoom(tab_ix, zoomed_pane, false, window, cx);
+        }
         {
             let Some(WorkspaceTab::Terminal { panes, focused, .. }) = self.tabs.get_mut(tab_ix)
             else {
@@ -1498,51 +1516,6 @@ impl NebulaWorkspace {
             self.sync_side_panel_to_active(true, cx);
         }
         cx.notify();
-    }
-
-    /// ctrl+alt+方向：按上一帧 pane 矩形找目标方向最近邻（垂直漂移 4 倍
-    /// 惩罚，`nebula_split::nav_target` 与旧壳同式）。缩放态先退出缩放再
-    /// 导航，pane 矩形下一帧才有——本次导航按缩放前记录的矩形执行。
-    fn navigate_pane(&mut self, nav: SplitNav, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.active;
-        let Some(WorkspaceTab::Terminal { panes, focused, zoomed, .. }) = self.tabs.get_mut(active)
-        else {
-            return;
-        };
-        if panes.len() < 2 {
-            return;
-        }
-        *zoomed = false;
-        let focused_id = *focused;
-        let bounds = self.pane_bounds.borrow();
-        let rects: Vec<(u64, nebula_split::Rect)> = panes
-            .iter()
-            .filter_map(|pane| bounds.get(&pane.id).map(|b| (pane.id, to_split_rect(b))))
-            .collect();
-        drop(bounds);
-        if let Some(target) = nebula_split::nav_target(&rects, focused_id, nav) {
-            self.focus_pane(active, target, window, cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    /// ctrl+shift+enter：聚焦 pane 满卡缩放开关（旧壳 ToggleZoom）。
-    fn toggle_zoom(&mut self, cx: &mut Context<Self>) {
-        let active = self.active;
-        let toggled = match self.tabs.get_mut(active) {
-            Some(WorkspaceTab::Terminal { panes, zoomed, .. }) if panes.len() > 1 => {
-                *zoomed = !*zoomed;
-                true
-            },
-            _ => false,
-        };
-        if toggled {
-            // 缩放把一个 pane 的几何从半卡拉到整卡（其余 pane 反之），是一次性
-            // 结构变化，同 split/close 走同步下发。
-            self.mark_structural_resize(active, cx);
-            cx.notify();
-        }
     }
 
     /// 按视图实体反查 (tab 下标, pane id)。
@@ -1570,6 +1543,9 @@ impl NebulaWorkspace {
         // must first restore workspace chrome so an old entity cannot leave the
         // next active tab in an immersive layout.
         self.clear_reader_focus(cx);
+        // 删除 tab 会让后续下标整体左移；属于该 tab 的缩放瞬态先收掉，
+        // 其它 tab 的动效由 `advance_zoom_motion` 按 pane id 重新对位。
+        self.clear_zoom_motion_for_tab(ix, window);
         let Some((tab, _meta)) = self.remove_tab_at(ix) else { return };
         if let WorkspaceTab::Terminal { panes, .. } = &tab {
             let mut bounds = self.pane_bounds.borrow_mut();
@@ -2119,15 +2095,15 @@ impl NebulaWorkspace {
         self.prompt_save_workspace(export, &stem, window, cx);
     }
 
-    /// Terminal tab 的内容区：单叶直渲、缩放态聚焦 pane 满卡，否则按
-    /// 分屏树递归铺陈。
+    /// Terminal tab 的内容区：单叶直渲；分屏树始终按原布局铺陈，放大态的
+    /// 聚焦叶换成占位，真实终端只在 `zoom_overlay` 的悬浮卡里渲染一次。
     fn render_terminal_tab(&self, tab_ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(WorkspaceTab::Terminal { tree, panes, focused, zoomed, broadcast }) =
             self.tabs.get(tab_ix)
         else {
             return div().into_any_element();
         };
-        if *zoomed || tree.is_leaf() {
+        if tree.is_leaf() {
             let Some(pane) = self.tabs[tab_ix].primary_terminal_pane() else {
                 return div().into_any_element();
             };
@@ -2141,7 +2117,8 @@ impl NebulaWorkspace {
                 ordinal,
                 pane_header::header_visible(panes.len()),
                 true,
-                *zoomed,
+                false,
+                false,
                 *broadcast,
                 pane_header::HeaderCorners { top_left: true, top_right: true },
                 cx,
@@ -2149,17 +2126,19 @@ impl NebulaWorkspace {
         }
         let mut path = Vec::new();
         let order = pane_header::pane_order(tree);
-        self.render_split_node(
+        let split = self.render_split_node(
             tab_ix,
             tree,
             &mut path,
             panes,
             *focused,
+            (*zoomed).then_some(*focused),
             &order,
             *broadcast,
             pane_header::HeaderCorners { top_left: true, top_right: true },
             cx,
-        )
+        );
+        self.terminal_tab_content(tab_ix, split, cx)
     }
 
     /// 递归渲染分屏树。Split 节点 = flex 容器：first 占 `relative(ratio)`、
@@ -2182,6 +2161,7 @@ impl NebulaWorkspace {
         path: &mut Vec<bool>,
         panes: &[TerminalPane],
         focused: u64,
+        zoomed_pane: Option<u64>,
         order: &[u64],
         broadcast: bool,
         corners: pane_header::HeaderCorners,
@@ -2189,6 +2169,11 @@ impl NebulaWorkspace {
     ) -> gpui::AnyElement {
         match node {
             SplitTree::Leaf(id) => {
+                if zoomed_pane == Some(*id) {
+                    // 放大态的聚焦叶只保留几何占位；真实终端住在浮层里，
+                    // 同一个 TerminalView 不能同时挂两个位置。
+                    return div().size_full().min_w_0().min_h_0().into_any_element();
+                }
                 let Some(pane) = panes.iter().find(|pane| pane.id == *id) else {
                     return div().into_any_element();
                 };
@@ -2199,6 +2184,7 @@ impl NebulaWorkspace {
                     ordinal,
                     true,
                     *id == focused,
+                    false,
                     false,
                     broadcast,
                     corners,
@@ -2230,6 +2216,7 @@ impl NebulaWorkspace {
                     path,
                     panes,
                     focused,
+                    zoomed_pane,
                     order,
                     broadcast,
                     corners.first_child(direction),
@@ -2243,6 +2230,7 @@ impl NebulaWorkspace {
                     path,
                     panes,
                     focused,
+                    zoomed_pane,
                     order,
                     broadcast,
                     corners.second_child(direction),
